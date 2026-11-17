@@ -1,0 +1,510 @@
+name: Build Kaelltzyy Kernel (GKI 5.10 A12)
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Repo kernel"
+        default: "Arkael-Dev/arkael-kernel-a12-5.10"
+      branch:
+        description: "Branch"
+        default: "arkaelkernel"
+      defconfig:
+        description: "Defconfig"
+        default: "gki_defconfig"
+      schedutil_rate_limit_us:
+        description: "Default schedutil rate_limit_us (kosongkan untuk skip)"
+        default: "500"
+      zram_size_gb:
+        description: "Ukuran ZRAM dipaksa (GB, 0 atau kosong untuk skip)"
+        default: "4"
+      uname_release:
+        description: "Default uname -r untuk app (isi string kernel stock, kosongkan untuk skip)"
+        default: ""
+      turbo_headroom:
+        description: "Turbo schedutil: off / normal (+25%) / strong (+50%)"
+        default: "strong"
+      bbr3_patch_url:
+        description: "URL raw patch TCP BBRv3 untuk 5.10 (kosongkan untuk skip)"
+        default: ""
+      adios_patch_url:
+        description: "URL raw patch I/O scheduler ADIOS untuk 5.10 (kosongkan untuk skip)"
+        default: ""
+      touch_boost_patch_url:
+        description: "URL raw patch input/touch boost (kosongkan untuk skip)"
+        default: ""
+      bore_patch_url:
+        description: "URL raw patch BORE untuk 5.10 (kosongkan untuk skip)"
+        default: "https://github.com/riza220201/itel-rs4-kernel/raw/refs/heads/main/patches/bore-5.10-kmi.patch"
+      kernelsu:
+        description: "KernelSU-Next: latest (tag stabil terbaru) / next (branch dev) / off"
+        type: choice
+        options: [latest, next, off]
+        default: "latest"
+      susfs:
+        description: "SUSFS (hide root/mount/path). Butuh kernelsu != off"
+        type: choice
+        options: [on, off]
+        default: "on"
+      ksu_susfs_branch:
+        description: "Branch KernelSU-Next yang sudah ada integrasi SUSFS (dipakai kalau susfs=on)"
+        default: "next-susfs"
+      susfs_kernel_branch:
+        description: "Branch susfs4ksu untuk patch sisi kernel (dipakai kalau source belum punya fs/susfs.c)"
+        default: "gki-android12-5.10"
+      gaming_tweaks:
+        description: "Gaming tweaks (config perf, TCP anti-lag): on / off"
+        type: choice
+        options: [on, off]
+        default: "on"
+      opt_o3:
+        description: "Compile -O3 (lebih kencang, build lebih lama, kecil kemungkinan gagal): on / off"
+        type: choice
+        options: ["off", "on"]
+        default: "on"
+      gpu_floor_pct:
+        description: "GPU Mali: lantai frekuensi min, % dari max (0 = mati; boros baterai dan panas)"
+        default: "50"
+      min_floor_pct:
+        description: "EXTREME: lantai frekuensi min CPU permanen, % dari max (0 = mati; boros baterai dan panas)"
+        default: "50"
+      input_boost_ms:
+        description: "Durasi touch boost default (ms, kosongkan untuk skip)"
+        default: "300"
+      input_boost_pct:
+        description: "Touch boost: persen max freq (1-100, kosongkan untuk skip)"
+        default: "100"
+      spoof_temp_c:
+        description: "Suhu yang DITAMPILKAN ke app/sistem (C, kosongkan untuk mati). Suhu asli tetap dipakai kernel untuk shutdown darurat"
+        default: "15"
+      disable_debug:
+        description: "Matikan debug overhead kernel (DEBUG_INFO, lockdep, KASAN, dll): on / off"
+        type: choice
+        options: ["on", "off"]
+        default: "on"
+      ram_gaming:
+        description: "Optimasi RAM gaming (watermark, init_on_alloc off, SPF): on / off"
+        type: choice
+        options: ["on", "off"]
+        default: "on"
+      gaming_brutal:
+        description: "GAMING BRUTAL: kunci CPU idle latency saat sentuh layar dan saat game_mode (anti-jitter, boros baterai): on / off"
+        type: choice
+        options: ["on", "off"]
+        default: "on"
+      game_mode_boot:
+        description: "game_mode langsung ON sejak boot (floor game + GPU lock + idle lock, tanpa modul; PANAS): on / off"
+        type: choice
+        options: ["off", "on"]
+        default: "off"
+      game_min_pct:
+        description: "Floor CPU saat game_mode, % dari max (1-100, kosongkan = bawaan 100)"
+        default: ""
+      eas_off:
+        description: "Matikan EAS (scheduler tidak hemat energi, tugas ke core cepat; panas + boros): on / off"
+        type: choice
+        options: ["off", "on"]
+        default: "off"
+      io_default:
+        description: "I/O scheduler default: auto (adios kalau patch ADIOS terpasang, kalau tidak kyber) / adios / kyber / none / keep (mq-deadline bawaan)"
+        type: choice
+        options: [auto, adios, kyber, none, keep]
+        default: "auto"
+      gaming_system:
+        description: "Gaming non CPU/GPU: IRQ wifi+UFS ke core besar, TCP latency saat download (TSQ 256K): on / off"
+        type: choice
+        options: ["on", "off"]
+        default: "on"
+      lto_mode:
+        description: "LTO: thin (default, hemat RAM) / none (paling hemat, CFI ikut dimatikan)"
+        type: choice
+        options: [thin, none]
+        default: "thin"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/share/swift /opt/hostedtoolcache/CodeQL
+          df -h
+
+      - name: Add swap (cegah OOM saat link LTO)
+        run: |
+          free -h
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git zip bc bison flex libssl-dev libelf-dev \
+            rsync python3 cpio curl zstd xz-utils
+
+      - name: Install Neutron Clang
+        run: |
+          mkdir -p $HOME/neutron && cd $HOME/neutron
+          bash <(curl -s https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman) -S
+          echo "$HOME/neutron/bin" >> $GITHUB_PATH
+          $HOME/neutron/bin/clang --version | head -1
+
+      - name: Clone kernel
+        run: |
+          git config --global http.postBuffer 524288000
+          git config --global http.version HTTP/1.1
+          for i in 1 2 3 4 5; do
+            rm -rf kernel
+            if git clone --depth=1 --single-branch -b ${{ inputs.branch }} \
+                https://github.com/${{ inputs.repo }} kernel; then
+              break
+            fi
+            echo "::warning::clone gagal (percobaan $i/5), coba lagi..."
+            [ "$i" = 5 ] && { echo "::error::clone gagal 5x"; exit 1; }
+            sleep $((i * 15))
+          done
+
+      - name: Add Kaelltzyy driver (Sandevistan, Yamada, uname spoof, thermal+bat spoof)
+        run: |
+          cd kernel
+          cat > drivers/misc/kaelltzyy.c <<'KZEOF'
+          // SPDX-License-Identifier: GPL-2.0
+          /*
+           * Kaelltzyy tweaks:
+           *  - Sandevistan Boot: max CPU min-freq at boot, released after boot_boost_ms
+           *  - Yamada input boost: CPU min-freq boost on touch
+           *  - Multi target uname spoof: per-app uname release/version override
+           *  - Temp spoof (hanya tampilan ke userspace): suhu thermal zone + suhu baterai
+           */
+          #define pr_fmt(fmt) "kaelltzyy: " fmt
+
+          #include <linux/init.h>
+          #include <linux/module.h>
+          #include <linux/cpu.h>
+          #include <linux/cpufreq.h>
+          #include <linux/cpumask.h>
+          #include <linux/pm_qos.h>
+          #include <linux/workqueue.h>
+          #include <linux/input.h>
+          #include <linux/mutex.h>
+          #include <linux/slab.h>
+          #include <linux/string.h>
+          #include <linux/cred.h>
+          #include <linux/uidgid.h>
+          #include <linux/utsname.h>
+          #include <linux/mmzone.h>
+          #include <linux/sched.h>
+          #include <linux/irq.h>
+          #include <linux/irqdesc.h>
+          #include <linux/irqnr.h>
+          #include <linux/interrupt.h>
+          #include <linux/nodemask.h>
+          #include <linux/fs.h>
+          #include <linux/kernel.h>
+          #include <linux/thermal.h>
+          #include <linux/power_supply.h>
+
+          static unsigned int boot_boost_ms = 60000;
+          module_param(boot_boost_ms, uint, 0644);
+          static unsigned int input_boost_ms = 120;
+          module_param(input_boost_ms, uint, 0644);
+          static unsigned int input_boost_pct = 80;
+          module_param(input_boost_pct, uint, 0644);
+          static unsigned int min_floor_pct = 0;
+          module_param(min_floor_pct, uint, 0644);
+
+          static unsigned int uname_uids[16];
+          static int uname_nuids;
+          module_param_array(uname_uids, uint, &uname_nuids, 0644);
+          static char uname_release[65];
+          module_param_string(uname_release, uname_release, sizeof(uname_release), 0644);
+          static char uname_version[65];
+          module_param_string(uname_version, uname_version, sizeof(uname_version), 0644);
+          static bool uname_all_apps = true;
+          module_param(uname_all_apps, bool, 0644);
+
+          /*
+           * Spoof suhu HANYA di sisi tampilan (sysfs). Kernel (shutdown darurat,
+           * charger) tetap memakai suhu asli.
+           *   temp_spoof    : on/off
+           *   temp_spoof_mc : suhu yang ditampilkan, milli-Celsius (15000 = 15 C)
+           */
+          static bool temp_spoof = true;
+          module_param(temp_spoof, bool, 0644);
+          static int temp_spoof_mc = 15000;
+          module_param(temp_spoof_mc, int, 0644);
+
+          struct kz_pol {
+              struct freq_qos_request boot_req;
+              struct freq_qos_request input_req;
+              struct freq_qos_request floor_req;
+              struct freq_qos_request game_req;
+              bool floor_on;
+              unsigned int max_freq;
+              bool init;
+          };
+
+          static struct kz_pol kz[NR_CPUS];
+          static DEFINE_MUTEX(kz_lock);
+          static bool boot_active = true;
+          static unsigned long attach_deadline;
+          static struct delayed_work attach_work;
+          static struct delayed_work boot_end_work;
+          static struct delayed_work input_off_work;
+          static struct work_struct input_on_work;
+          static struct delayed_work affinity_work;
+          static struct cpumask kz_big_mask;
+          static bool kz_have_big;
+
+          static unsigned int game_min_pct = 100;
+          module_param(game_min_pct, uint, 0644);
+          static bool game_mode;
+
+          static unsigned int kz_game_floor(unsigned int max_freq)
+          {
+              return max_freq / 100 * min_t(unsigned int, game_min_pct, 100);
+          }
+
+
+          /* dipanggil dari drivers/thermal/thermal_sysfs.c (temp_show), satuan mC */
+          int kaelltzyy_zone_temp(int real)
+          {
+              if (!READ_ONCE(temp_spoof))
+                  return real;
+              return min(real, READ_ONCE(temp_spoof_mc));
+          }
+
+          /* dipanggil dari drivers/power/supply/power_supply_sysfs.c, satuan 0.1 C */
+          int kaelltzyy_bat_temp(int real)
+          {
+              if (!READ_ONCE(temp_spoof))
+                  return real;
+              return min(real, READ_ONCE(temp_spoof_mc) / 100);
+          }
+
+          /* Attach QoS requests to every cpufreq policy that has appeared so far. */
+          static void kz_attach(void)
+          {
+              unsigned int cpu;
+
+              for_each_possible_cpu(cpu) {
+                  struct cpufreq_policy *p = cpufreq_cpu_get(cpu);
+                  unsigned int first;
+
+                  if (!p)
+                      continue;
+                  first = cpumask_first(p->related_cpus);
+                  if (first == cpu && !kz[first].init) {
+                      kz[first].max_freq = p->cpuinfo.max_freq;
+                      if (freq_qos_add_request(&p->constraints, &kz[first].boot_req,
+                              FREQ_QOS_MIN,
+                              boot_active ? p->cpuinfo.max_freq : FREQ_QOS_MIN_DEFAULT_VALUE) < 0)
+                          goto next;
+                      if (freq_qos_add_request(&p->constraints, &kz[first].input_req,
+                              FREQ_QOS_MIN, FREQ_QOS_MIN_DEFAULT_VALUE) < 0) {
+                          freq_qos_remove_request(&kz[first].boot_req);
+                          goto next;
+                      }
+                              if (freq_qos_add_request(&p->constraints, &kz[first].game_req,
+                                      FREQ_QOS_MIN,
+                                      game_mode ? kz_game_floor(kz[first].max_freq) :
+                                                  FREQ_QOS_MIN_DEFAULT_VALUE) < 0) {
+                                  freq_qos_remove_request(&kz[first].boot_req);
+                                  freq_qos_remove_request(&kz[first].input_req);
+                                  goto next;
+                              }
+
+                                if (min_floor_pct)
+                                    kz[first].floor_on = freq_qos_add_request(&p->constraints,
+                                            &kz[first].floor_req, FREQ_QOS_MIN,
+                                            p->cpuinfo.max_freq / 100 *
+                                            min_t(unsigned int, min_floor_pct, 100)) >= 0;
+                                kz[first].init = true;
+                      pr_info("policy%u attached (max %u kHz)\n", first, kz[first].max_freq);
+                  }
+          next:
+                  cpufreq_cpu_put(p);
+              }
+          }
+
+          static void kz_attach_fn(struct work_struct *w)
+          {
+              mutex_lock(&kz_lock);
+              kz_attach();
+              mutex_unlock(&kz_lock);
+              if (time_before(jiffies, attach_deadline))
+                  schedule_delayed_work(&attach_work, 2 * HZ);
+          }
+
+          static void kz_boot_end_fn(struct work_struct *w)
+          {
+              int i;
+
+              mutex_lock(&kz_lock);
+              boot_active = false;
+              for (i = 0; i < NR_CPUS; i++)
+                  if (kz[i].init)
+                      freq_qos_update_request(&kz[i].boot_req, FREQ_QOS_MIN_DEFAULT_VALUE);
+              mutex_unlock(&kz_lock);
+              pr_info("Sandevistan boot boost released\n");
+          }
+
+          static void kz_input_on_fn(struct work_struct *w)
+          {
+              unsigned int pct = min_t(unsigned int, input_boost_pct, 100);
+              int i;
+
+              if (!input_boost_ms)
+                  return;
+              mutex_lock(&kz_lock);
+              for (i = 0; i < NR_CPUS; i++)
+                  if (kz[i].init)
+                      freq_qos_update_request(&kz[i].input_req, kz[i].max_freq / 100 * pct);
+              mutex_unlock(&kz_lock);
+              mod_delayed_work(system_wq, &input_off_work, msecs_to_jiffies(input_boost_ms));
+          }
+
+          static void kz_input_off_fn(struct work_struct *w)
+          {
+              int i;
+
+              mutex_lock(&kz_lock);
+              for (i = 0; i < NR_CPUS; i++)
+                  if (kz[i].init)
+                      freq_qos_update_request(&kz[i].input_req, FREQ_QOS_MIN_DEFAULT_VALUE);
+              mutex_unlock(&kz_lock);
+          }
+
+          static void kz_input_event(struct input_handle *h, unsigned int type,
+                                     unsigned int code, int value)
+          {
+              if ((type == EV_ABS && code == ABS_MT_TRACKING_ID && value >= 0) ||
+                  (type == EV_KEY && code == BTN_TOUCH && value == 1))
+                  queue_work(system_highpri_wq, &input_on_work);
+          }
+
+          static int kz_input_connect(struct input_handler *handler, struct input_dev *dev,
+                                      const struct input_device_id *id)
+          {
+              struct input_handle *handle;
+              int ret;
+
+              handle = kzalloc(sizeof(*handle), GFP_KERNEL);
+              if (!handle)
+                  return -ENOMEM;
+              handle->dev = dev;
+              handle->handler = handler;
+              handle->name = "kaelltzyy_boost";
+              ret = input_register_handle(handle);
+              if (ret)
+                  goto err;
+              ret = input_open_device(handle);
+              if (ret)
+                  goto unreg;
+              return 0;
+          unreg:
+              input_unregister_handle(handle);
+          err:
+              kfree(handle);
+              return ret;
+          }
+
+          static void kz_input_disconnect(struct input_handle *handle)
+          {
+              input_close_device(handle);
+              input_unregister_handle(handle);
+              kfree(handle);
+          }
+
+          static const struct input_device_id kz_ids[] = {
+              {
+                  .flags = INPUT_DEVICE_ID_MATCH_EVBIT | INPUT_DEVICE_ID_MATCH_ABSBIT,
+                  .evbit = { BIT_MASK(EV_ABS) },
+                  .absbit = { [BIT_WORD(ABS_MT_POSITION_X)] =
+                      BIT_MASK(ABS_MT_POSITION_X) | BIT_MASK(ABS_MT_POSITION_Y) },
+              },
+              { },
+          };
+
+          static struct input_handler kz_input_handler = {
+              .event      = kz_input_event,
+              .connect    = kz_input_connect,
+              .disconnect = kz_input_disconnect,
+              .name       = "kaelltzyy_boost",
+              .id_table   = kz_ids,
+          };
+
+          static void kz_apply_uname(struct new_utsname *u)
+          {
+              if (uname_release[0])
+                  strscpy(u->release, uname_release, sizeof(u->release));
+              if (uname_version[0])
+                  strscpy(u->version, uname_version, sizeof(u->version));
+          }
+
+          void kaelltzyy_spoof_uname(struct new_utsname *u)
+          {
+              uid_t appid = from_kuid(&init_user_ns, current_uid()) % 100000;
+              int i, n = READ_ONCE(uname_nuids);
+
+              if (!uname_release[0] && !uname_version[0])
+                  return;
+              if (n <= 0) {
+                  if (uname_all_apps && appid >= 10000)
+                      kz_apply_uname(u);
+                  return;
+              }
+              for (i = 0; i < n && i < ARRAY_SIZE(uname_uids); i++) {
+                  if (uname_uids[i] == appid) {
+                      kz_apply_uname(u);
+                      return;
+                  }
+              }
+          }
+
+          static void kz_affinity_fn(struct work_struct *w)
+          {
+              unsigned int cpu, maxf = 0, irq;
+              int nid;
+
+              for_each_possible_cpu(cpu) {
+                  struct cpufreq_policy *p = cpufreq_cpu_get(cpu);
+
+                  if (!p)
+                      continue;
+                  if (p->cpuinfo.max_freq > maxf) {
+                      maxf = p->cpuinfo.max_freq;
+                      cpumask_copy(&kz_big_mask, p->related_cpus);
+                      kz_have_big = true;
+                  }
+                  cpufreq_cpu_put(p);
+              }
+              if (!kz_have_big)
+                  return;
+
+              for_each_online_node(nid) {
+                  pg_data_t *pgdat = NODE_DATA(nid);
+
+                  if (pgdat && pgdat->kswapd)
+                      set_cpus_allowed_ptr(pgdat->kswapd, &kz_big_mask);
+              }
+
+              for (irq = 0; irq < nr_irqs; irq++) {
+                  struct irq_desc *desc = irq_to_desc(irq);
+                  const char *name;
+
+                  if (!desc || !desc->action)
+                      continue;
+                  name = desc->action->name;
+                  if (!name)
+                      continue;
+                  if (strstr(name, "touch") || strstr(name, "tpd") ||
+                      strstr(name, "mali") || strstr(name, "gpu") ||
+                      strstr(name, "kgsl") || strstr(name, "adreno") ||
+                      strstr(name, "goodix") || strstr(name, "fts") ||
+                     
