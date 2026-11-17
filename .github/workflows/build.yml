@@ -23,7 +23,7 @@ on:
         default: ""
       turbo_headroom:
         description: "Turbo schedutil: off / normal (+25%) / strong (+50%)"
-        default: "normal"
+        default: "strong"
       bbr3_patch_url:
         description: "URL raw patch TCP BBRv3 untuk 5.10 (kosongkan untuk skip)"
         default: ""
@@ -35,14 +35,35 @@ on:
         default: ""
       bore_patch_url:
         description: "URL raw patch BORE untuk 5.10 (kosongkan untuk skip)"
-        default: ""
+        default: "https://github.com/riza220201/itel-rs4-kernel/raw/refs/heads/main/patches/bore-5.10-kmi.patch"
       kernelsu:
         description: "KernelSU-Next: latest (tag stabil terbaru) / next (branch dev) / off"
         type: choice
         options: [latest, next, off]
         default: "latest"
+      susfs:
+        description: "SUSFS (hide root/mount/path). Butuh kernelsu != off"
+        type: choice
+        options: [on, off]
+        default: "on"
+      ksu_susfs_branch:
+        description: "Branch KernelSU-Next yang sudah ada integrasi SUSFS (dipakai kalau susfs=on)"
+        default: "next-susfs"
+      susfs_kernel_branch:
+        description: "Branch susfs4ksu untuk patch sisi kernel (dipakai kalau source belum punya fs/susfs.c)"
+        default: "gki-android12-5.10"
       gaming_tweaks:
         description: "Gaming tweaks (config perf, TCP anti-lag): on / off"
+        type: choice
+        options: [on, off]
+        default: "on"
+      ram_gaming:
+        description: "RAM gaming: kurangi stall alokasi/reclaim (compaction, watermark, KSM/THP off, init_on_alloc off): on / off"
+        type: choice
+        options: [on, off]
+        default: "on"
+      debug_off:
+        description: "Matikan overhead debug (lockdep, slub debug, debug info, page owner, dll): on / off"
         type: choice
         options: [on, off]
         default: "on"
@@ -50,13 +71,22 @@ on:
         description: "Compile -O3 (lebih kencang, build lebih lama, kecil kemungkinan gagal): on / off"
         type: choice
         options: ["off", "on"]
-        default: "off"
+        default: "on"
+      gpu_floor_pct:
+        description: "GPU Mali: lantai frekuensi min, % dari max (0 = mati; boros baterai dan panas)"
+        default: "50"
+      min_floor_pct:
+        description: "EXTREME: lantai frekuensi min CPU permanen, % dari max (0 = mati; boros baterai dan panas)"
+        default: "50"
       input_boost_ms:
         description: "Durasi touch boost default (ms, kosongkan untuk skip)"
-        default: "200"
+        default: "300"
       input_boost_pct:
         description: "Touch boost: persen max freq (1-100, kosongkan untuk skip)"
-        default: "90"
+        default: "100"
+      spoof_temp_c:
+        description: "Suhu yang DITAMPILKAN ke app/sistem (C, kosongkan untuk mati). Suhu asli tetap dipakai kernel untuk shutdown darurat"
+        default: "15"
       lto_mode:
         description: "LTO: thin (default, hemat RAM) / none (paling hemat, CFI ikut dimatikan)"
         type: choice
@@ -111,7 +141,7 @@ jobs:
             sleep $((i * 15))
           done
 
-      - name: Add Kaelltzyy driver (Sandevistan, Yamada, uname spoof)
+      - name: Add Kaelltzyy driver (Sandevistan, Yamada, uname spoof, thermal+bat spoof)
         run: |
           cd kernel
           cat > drivers/misc/kaelltzyy.c <<'KZEOF'
@@ -121,6 +151,7 @@ jobs:
            *  - Sandevistan Boot: max CPU min-freq at boot, released after boot_boost_ms
            *  - Yamada input boost: CPU min-freq boost on touch
            *  - Multi target uname spoof: per-app uname release/version override
+           *  - Temp spoof (hanya tampilan ke userspace): suhu thermal zone + suhu baterai
            */
           #define pr_fmt(fmt) "kaelltzyy: " fmt
 
@@ -145,6 +176,10 @@ jobs:
           #include <linux/irqnr.h>
           #include <linux/interrupt.h>
           #include <linux/nodemask.h>
+          #include <linux/fs.h>
+          #include <linux/kernel.h>
+          #include <linux/thermal.h>
+          #include <linux/power_supply.h>
 
           static unsigned int boot_boost_ms = 60000;
           module_param(boot_boost_ms, uint, 0644);
@@ -152,6 +187,8 @@ jobs:
           module_param(input_boost_ms, uint, 0644);
           static unsigned int input_boost_pct = 80;
           module_param(input_boost_pct, uint, 0644);
+          static unsigned int min_floor_pct = 0;
+          module_param(min_floor_pct, uint, 0644);
 
           static unsigned int uname_uids[16];
           static int uname_nuids;
@@ -163,9 +200,23 @@ jobs:
           static bool uname_all_apps = true;
           module_param(uname_all_apps, bool, 0644);
 
+          /*
+           * Spoof suhu HANYA di sisi tampilan (sysfs). Kernel (shutdown darurat,
+           * charger) tetap memakai suhu asli.
+           *   temp_spoof    : on/off
+           *   temp_spoof_mc : suhu yang ditampilkan, milli-Celsius (15000 = 15 C)
+           */
+          static bool temp_spoof = true;
+          module_param(temp_spoof, bool, 0644);
+          static int temp_spoof_mc = 15000;
+          module_param(temp_spoof_mc, int, 0644);
+
           struct kz_pol {
               struct freq_qos_request boot_req;
               struct freq_qos_request input_req;
+              struct freq_qos_request floor_req;
+              struct freq_qos_request game_req;
+              bool floor_on;
               unsigned int max_freq;
               bool init;
           };
@@ -181,6 +232,32 @@ jobs:
           static struct delayed_work affinity_work;
           static struct cpumask kz_big_mask;
           static bool kz_have_big;
+
+          static unsigned int game_min_pct = 100;
+          module_param(game_min_pct, uint, 0644);
+          static bool game_mode;
+
+          static unsigned int kz_game_floor(unsigned int max_freq)
+          {
+              return max_freq / 100 * min_t(unsigned int, game_min_pct, 100);
+          }
+
+
+          /* dipanggil dari drivers/thermal/thermal_sysfs.c (temp_show), satuan mC */
+          int kaelltzyy_zone_temp(int real)
+          {
+              if (!READ_ONCE(temp_spoof))
+                  return real;
+              return min(real, READ_ONCE(temp_spoof_mc));
+          }
+
+          /* dipanggil dari drivers/power/supply/power_supply_sysfs.c, satuan 0.1 C */
+          int kaelltzyy_bat_temp(int real)
+          {
+              if (!READ_ONCE(temp_spoof))
+                  return real;
+              return min(real, READ_ONCE(temp_spoof_mc) / 100);
+          }
 
           /* Attach QoS requests to every cpufreq policy that has appeared so far. */
           static void kz_attach(void)
@@ -205,7 +282,21 @@ jobs:
                           freq_qos_remove_request(&kz[first].boot_req);
                           goto next;
                       }
-                      kz[first].init = true;
+                              if (freq_qos_add_request(&p->constraints, &kz[first].game_req,
+                                      FREQ_QOS_MIN,
+                                      game_mode ? kz_game_floor(kz[first].max_freq) :
+                                                  FREQ_QOS_MIN_DEFAULT_VALUE) < 0) {
+                                  freq_qos_remove_request(&kz[first].boot_req);
+                                  freq_qos_remove_request(&kz[first].input_req);
+                                  goto next;
+                              }
+
+                                if (min_floor_pct)
+                                    kz[first].floor_on = freq_qos_add_request(&p->constraints,
+                                            &kz[first].floor_req, FREQ_QOS_MIN,
+                                            p->cpuinfo.max_freq / 100 *
+                                            min_t(unsigned int, min_floor_pct, 100)) >= 0;
+                                kz[first].init = true;
                       pr_info("policy%u attached (max %u kHz)\n", first, kz[first].max_freq);
                   }
           next:
@@ -328,7 +419,6 @@ jobs:
                   strscpy(u->version, uname_version, sizeof(u->version));
           }
 
-          /* Called from newuname(): listed app ids, or every app (uid >= 10000) if none listed. */
           void kaelltzyy_spoof_uname(struct new_utsname *u)
           {
               uid_t appid = from_kuid(&init_user_ns, current_uid()) % 100000;
@@ -349,7 +439,6 @@ jobs:
               }
           }
 
-          /* Kureiji Ollie: kswapd + touch/GPU IRQ to the fastest cluster. */
           static void kz_affinity_fn(struct work_struct *w)
           {
               unsigned int cpu, maxf = 0, irq;
@@ -387,11 +476,135 @@ jobs:
                   if (!name)
                       continue;
                   if (strstr(name, "touch") || strstr(name, "tpd") ||
-                      strstr(name, "mali") || strstr(name, "gpu"))
+                      strstr(name, "mali") || strstr(name, "gpu") ||
+                      strstr(name, "kgsl") || strstr(name, "adreno") ||
+                      strstr(name, "goodix") || strstr(name, "fts") ||
+                      strstr(name, "nvt") || strstr(name, "synaptics"))
                       irq_set_affinity(irq, &kz_big_mask);
               }
               pr_info("kswapd/irq affinity applied\n");
           }
+
+          #define KZ_GPU_DEVFREQ "/sys/class/devfreq/13000000.mali"
+
+          static unsigned int gpu_floor_pct;
+          module_param(gpu_floor_pct, uint, 0644);
+
+          static struct delayed_work gpu_work;
+          static unsigned long gpu_deadline;
+          static bool gpu_toggles_done, gpu_floor_done;
+
+          static const struct {
+              const char *path;
+              const char *val;
+          } kz_ged[] = {
+              { "/sys/module/ged/parameters/boost_gpu_enable", "1" },
+              { "/sys/module/ged/parameters/ged_boost_enable", "1" },
+              { "/sys/module/ged/parameters/enable_gpu_boost", "1" },
+          };
+
+          static int kz_write_file(const char *path, const char *val)
+          {
+              struct file *f = filp_open(path, O_WRONLY, 0);
+              loff_t pos = 0;
+              ssize_t r;
+
+              if (IS_ERR(f))
+                  return PTR_ERR(f);
+              r = kernel_write(f, val, strlen(val), &pos);
+              filp_close(f, NULL);
+              return r < 0 ? (int)r : 0;
+          }
+
+          static int kz_read_ulong(const char *path, unsigned long *out)
+          {
+              struct file *f = filp_open(path, O_RDONLY, 0);
+              char buf[32] = { };
+              loff_t pos = 0;
+              ssize_t r;
+
+              if (IS_ERR(f))
+                  return PTR_ERR(f);
+              r = kernel_read(f, buf, sizeof(buf) - 1, &pos);
+              filp_close(f, NULL);
+              if (r <= 0)
+                  return r ? (int)r : -EIO;
+              return kstrtoul(buf, 10, out);
+          }
+
+          static void kz_gpu_fn(struct work_struct *w)
+          {
+              unsigned long maxf, target;
+              char buf[24];
+              int i, ok = 0;
+
+              if (!gpu_toggles_done) {
+                  for (i = 0; i < ARRAY_SIZE(kz_ged); i++)
+                      if (!kz_write_file(kz_ged[i].path, kz_ged[i].val))
+                          ok++;
+                  if (ok) {
+                      gpu_toggles_done = true;
+                      pr_info("GED boost toggles set (%d)\n", ok);
+                  }
+              }
+              if (gpu_floor_pct && !gpu_floor_done &&
+                  !kz_read_ulong(KZ_GPU_DEVFREQ "/max_freq", &maxf) && maxf) {
+                  target = maxf / 100 * min_t(unsigned int, gpu_floor_pct, 100);
+                  snprintf(buf, sizeof(buf), "%lu", target);
+                  if (!kz_write_file(KZ_GPU_DEVFREQ "/min_freq", buf)) {
+                      gpu_floor_done = true;
+                      pr_info("GPU floor set to %lu Hz\n", target);
+                  }
+              }
+              if ((!gpu_toggles_done || (gpu_floor_pct && !gpu_floor_done)) &&
+                  time_before(jiffies, gpu_deadline))
+                  schedule_delayed_work(&gpu_work, 5 * HZ);
+          }
+
+          /* GPU: lock min_freq ke max saat game mode, balik ke floor/0 saat off */
+          static void kz_gpu_lock(bool on)
+          {
+              unsigned long maxf, target = 0;
+              char buf[24];
+
+              if (kz_read_ulong(KZ_GPU_DEVFREQ "/max_freq", &maxf) || !maxf)
+                  return;
+              if (on)
+                  target = maxf;
+              else if (gpu_floor_pct)
+                  target = maxf / 100 * min_t(unsigned int, gpu_floor_pct, 100);
+              snprintf(buf, sizeof(buf), "%lu", target);
+              kz_write_file(KZ_GPU_DEVFREQ "/min_freq", buf);
+          }
+
+          /* echo 1 > /sys/module/kaelltzyy/parameters/game_mode  (0 untuk mati) */
+          static int kz_game_set(const char *val, const struct kernel_param *kp)
+          {
+              bool on;
+              int i, ret;
+
+              ret = kstrtobool(val, &on);
+              if (ret)
+                  return ret;
+              mutex_lock(&kz_lock);
+              game_mode = on;
+              for (i = 0; i < NR_CPUS; i++)
+                  if (kz[i].init)
+                      freq_qos_update_request(&kz[i].game_req,
+                          on ? kz_game_floor(kz[i].max_freq) : FREQ_QOS_MIN_DEFAULT_VALUE);
+              mutex_unlock(&kz_lock);
+              kz_gpu_lock(on);
+              if (on)
+                  mod_delayed_work(system_wq, &affinity_work, 0);
+              pr_info("game mode %s\n", on ? "ON" : "OFF");
+              return 0;
+          }
+
+          static const struct kernel_param_ops kz_game_ops = {
+              .set = kz_game_set,
+              .get = param_get_bool,
+          };
+          module_param_cb(game_mode, &kz_game_ops, &game_mode, 0644);
 
           static int __init kz_init(void)
           {
@@ -401,6 +614,9 @@ jobs:
               INIT_WORK(&input_on_work, kz_input_on_fn);
               INIT_DELAYED_WORK(&affinity_work, kz_affinity_fn);
               schedule_delayed_work(&affinity_work, 60 * HZ);
+              INIT_DELAYED_WORK(&gpu_work, kz_gpu_fn);
+              gpu_deadline = jiffies + 600 * HZ;
+              schedule_delayed_work(&gpu_work, 30 * HZ);
 
               if (!boot_boost_ms)
                   boot_active = false;
@@ -440,8 +656,8 @@ jobs:
           s = open(p).read()
           if 'KAELLTZYY' not in s:
               cfg = ('config KAELLTZYY\n'
-                     '\tbool "Kaelltzyy tweaks (boot boost, input boost, uname spoof)"\n'
-                     '\tdepends on CPU_FREQ\n'
+                     '\tbool "Kaelltzyy tweaks (boot boost, input boost, uname/thermal/bat spoof)"\n'
+                     '\tdepends on CPU_FREQ && THERMAL && POWER_SUPPLY\n'
                      '\tdefault y\n\n')
               k = s.rindex('endmenu')
               open(p, 'w').write(s[:k] + cfg + s[k:])
@@ -505,6 +721,42 @@ jobs:
           PYEOF
           grep -nE "input_boost_(ms|pct) =" drivers/misc/kaelltzyy.c
 
+      - name: Min freq floor default (extreme)
+        if: ${{ inputs.min_floor_pct != '' && inputs.min_floor_pct != '0' }}
+        env:
+          PCT: ${{ inputs.min_floor_pct }}
+        run: |
+          cd kernel
+          python3 - <<'PYEOF'
+          import os
+          p = 'drivers/misc/kaelltzyy.c'
+          s = open(p).read()
+          n = max(1, min(100, int(os.environ['PCT'])))
+          old = 'static unsigned int min_floor_pct = 0;'
+          assert old in s
+          s = s.replace(old, 'static unsigned int min_floor_pct = %d;' % n)
+          open(p, 'w').write(s)
+          print('min_floor_pct =', n)
+          PYEOF
+
+      - name: GPU floor default
+        if: ${{ inputs.gpu_floor_pct != '' && inputs.gpu_floor_pct != '0' }}
+        env:
+          PCT: ${{ inputs.gpu_floor_pct }}
+        run: |
+          cd kernel
+          python3 - <<'PYEOF'
+          import os
+          p = 'drivers/misc/kaelltzyy.c'
+          s = open(p).read()
+          n = max(1, min(100, int(os.environ['PCT'])))
+          old = 'static unsigned int gpu_floor_pct;'
+          assert old in s
+          s = s.replace(old, 'static unsigned int gpu_floor_pct = %d;' % n)
+          open(p, 'w').write(s)
+          print('gpu_floor_pct =', n)
+          PYEOF
+
       - name: Force ZRAM disksize
         if: ${{ inputs.zram_size_gb != '' && inputs.zram_size_gb != '0' }}
         env:
@@ -550,6 +802,97 @@ jobs:
           patch('include/linux/mm.h', [('(SZ_128K / PAGE_SIZE)', '(SZ_512K / PAGE_SIZE)')])
           PYEOF
 
+      - name: Clamp vfs_cache_pressure (tolak tulisan init > 50)
+        run: |
+          cd kernel
+          python3 - <<'PYEOF'
+          import re
+          p = 'kernel/sysctl.c'
+          s = open(p).read()
+          m = re.search(r'\.procname\s*=\s*"vfs_cache_pressure",', s)
+          assert m, 'entry vfs_cache_pressure tidak ditemukan'
+          end = s.index('},', m.end())
+          entry = s[m.start():end]
+          assert 'proc_dointvec_minmax' in entry, 'handler bukan minmax'
+          k = s.index('.extra1', m.end())
+          assert k < end, '.extra1 tidak ada di entry'
+          eol = s.index('\n', k)
+          s = s[:eol] + '\n\t\t.extra2\t\t= &kz_vfs_max,' + s[eol:]
+          t = s.index('static struct ctl_table vm_table[]')
+          s = s[:t] + 'static int kz_vfs_max = 50; /* Kaelltzyy */\n' + s[t:]
+          open(p, 'w').write(s)
+          print('vfs_cache_pressure di-clamp max 50')
+          PYEOF
+          grep -n "kz_vfs_max" kernel/sysctl.c
+
+      - name: Force ZRAM compressor lz4
+        run: |
+          cd kernel
+          python3 - <<'PYEOF'
+          p = 'drivers/block/zram/zram_drv.c'
+          s = open(p).read()
+          old = 'strlcpy(compressor, buf, sizeof(compressor));'
+          if old in s and 'Kaelltzyy lz4' not in s:
+              s = s.replace(old, old + ' strlcpy(compressor, "lz4", sizeof(compressor)); /* Kaelltzyy lz4 */', 1)
+              open(p, 'w').write(s)
+              print('zram comp_algorithm dipaksa lz4')
+          else:
+              print('::warning::baris comp_algorithm_store tidak ditemukan, lz4 hanya lewat default config')
+          PYEOF
+
+      - name: VM defaults (dirty, swappiness, min_free, OOM)
+        env:
+          SWAP_MAX: "20"
+        run: |
+          cd kernel
+          python3 - <<'PYEOF'
+          import os, re
+          def sub(path, pat, repl, label):
+              try:
+                  s = open(path).read()
+              except FileNotFoundError:
+                  print('::warning::file tidak ada:', path); return
+              n, c = re.subn(pat, repl, s, count=1)
+              if c:
+                  open(path, 'w').write(n); print('ok   ', label)
+              else:
+                  print('::warning::tidak ditemukan, dilewati:', label)
+
+          pw = 'mm/page-writeback.c'
+          sub(pw, r'(int\s+vm_dirty_ratio\s*=\s*)\d+;', r'\g<1>10;', 'dirty_ratio=10')
+          sub(pw, r'(int\s+dirty_background_ratio\s*=\s*)\d+;', r'\g<1>5;', 'dirty_background_ratio=5')
+          sub(pw, r'(dirty_writeback_interval\s*=\s*)[^;]+;', r'\g<1>3 * 100;', 'writeback 3s')
+          sub(pw, r'(dirty_expire_interval\s*=\s*)[^;]+;', r'\g<1>5 * 100;', 'dirty_expire 5s')
+
+          sw = os.environ['SWAP_MAX']
+          sub('mm/vmscan.c', r'(int\s+vm_swappiness\s*=\s*)\d+;', r'\g<1>' + sw + ';', 'swappiness default ' + sw)
+          sub('mm/page_alloc.c',
+              r'(new_min_free_kbytes\s*=\s*int_sqrt\(lowmem_kbytes\s*\*\s*16\))\s*;',
+              r'\g<1> + 5120; /* Kaelltzyy +5MB */', 'min_free_kbytes +5MB')
+          sub('mm/oom_kill.c', r'([ \t]*)/\* Normalize to oom_score_adj units \*/',
+              r'\g<1>points >>= 1; /* Kaelltzyy: halve base badness */\n\g<0>', 'oom badness /2')
+
+          p = 'kernel/sysctl.c'
+          s = open(p).read()
+          m = re.search(r'\.procname\s*=\s*"swappiness",', s)
+          if m:
+              end = s.index('},', m.end())
+              entry = s[m.start():end]
+              if re.search(r'\.extra2\s*=\s*[^,]+,', entry):
+                  new_entry = re.sub(r'(\.extra2\s*=\s*)[^,]+,', r'\g<1>&kz_swap_max,', entry, count=1)
+              else:
+                  k = entry.index('.extra1')
+                  eol = entry.index('\n', k)
+                  new_entry = entry[:eol] + '\n\t\t.extra2\t\t= &kz_swap_max,' + entry[eol:]
+              s = s[:m.start()] + new_entry + s[end:]
+              t = s.index('static struct ctl_table vm_table[]')
+              s = s[:t] + 'static int kz_swap_max = %s; /* Kaelltzyy */\n' % sw + s[t:]
+              open(p, 'w').write(s)
+              print('ok    swappiness di-clamp max', sw)
+          else:
+              print('::warning::entry swappiness tidak ditemukan, clamp dilewati')
+          PYEOF
+
       - name: Turbo schedutil (extra frequency headroom)
         if: ${{ inputs.turbo_headroom != 'off' }}
         run: |
@@ -583,43 +926,136 @@ jobs:
           PYEOF
           grep -n "Kaelltzyy nodelay" net/ipv4/tcp.c
 
-      - name: Add Kaelltzyy cpufreq governor (copy of performance)
+      - name: Thermal - matikan throttling + spoof suhu tampilan (shutdown darurat tetap aktif)
+        run: |
+          cd kernel
+
+          python3 - <<'PYEOF'
+          import re
+
+          # 1) Matikan throttling (governor/cooling device) tapi biarkan
+          #    critical/hot trip, jadi shutdown darurat kernel tetap jalan.
+          p = 'drivers/thermal/thermal_core.c'
+          try:
+              s = open(p).read()
+          except FileNotFoundError:
+              s = None
+              print('::warning::thermal_core.c tidak ada, skip')
+          if s is not None and 'Kaelltzyy no-throttle' not in s:
+              n, c = re.subn(r'(\n[ \t]*)handle_non_critical_trips\(([^;\n]*)\);',
+                             r'\1do { } while (0); /* Kaelltzyy no-throttle */', s, count=1)
+              if c:
+                  n = n.replace('static void handle_non_critical_trips(',
+                                'static void __maybe_unused handle_non_critical_trips(', 1)
+                  open(p, 'w').write(n)
+                  print('ok    throttling non-critical dimatikan (critical shutdown tetap)')
+              else:
+                  print('::warning::handle_non_critical_trips tidak ditemukan, throttling TIDAK dimatikan')
+
+          # 2) Spoof suhu thermal zone di tampilan sysfs (temp_show)
+          p = 'drivers/thermal/thermal_sysfs.c'
+          s = open(p).read()
+          if 'kaelltzyy_zone_temp' not in s:
+              i = s.find('temp_show(struct device *dev')
+              old = 'return sprintf(buf, "%d\\n", temperature);'
+              j = s.find(old, i) if i >= 0 else -1
+              if j >= 0:
+                  s = s[:j] + 'return sprintf(buf, "%d\\n", kaelltzyy_zone_temp(temperature));' + s[j + len(old):]
+                  decl = ('#ifdef CONFIG_KAELLTZYY\n'
+                          'extern int kaelltzyy_zone_temp(int real);\n'
+                          '#else\n'
+                          'static inline int kaelltzyy_zone_temp(int real) { return real; }\n'
+                          '#endif\n')
+                  k = list(re.finditer(r'^#include.*\n', s, re.M))[-1].end()
+                  s = s[:k] + decl + s[k:]
+                  open(p, 'w').write(s)
+                  print('ok    spoof suhu thermal zone (temp_show)')
+              else:
+                  print('::warning::temp_show tidak ditemukan, spoof suhu zone dilewati')
+
+          # 3) Spoof suhu baterai di tampilan sysfs/uevent
+          p = 'drivers/power/supply/power_supply_sysfs.c'
+          s = open(p).read()
+          if 'kaelltzyy_bat_temp' not in s:
+              i = s.find('power_supply_show_property(')
+              j = s.find('switch (psp) {', i) if i >= 0 else -1
+              if j >= 0:
+                  ins = ('if (psp == POWER_SUPPLY_PROP_TEMP)\n'
+                         '\t\tvalue.intval = kaelltzyy_bat_temp(value.intval);\n\n\t')
+                  s = s[:j] + ins + s[j:]
+                  decl = ('#ifdef CONFIG_KAELLTZYY\n'
+                          'extern int kaelltzyy_bat_temp(int real);\n'
+                          '#else\n'
+                          'static inline int kaelltzyy_bat_temp(int real) { return real; }\n'
+                          '#endif\n')
+                  k = list(re.finditer(r'^#include.*\n', s, re.M))[-1].end()
+                  s = s[:k] + decl + s[k:]
+                  open(p, 'w').write(s)
+                  print('ok    spoof suhu baterai (power_supply_show_property)')
+              else:
+                  print('::warning::power_supply_show_property tidak ditemukan, spoof baterai dilewati')
+          PYEOF
+
+          python3 - <<'PYEOF'
+          import re, os
+
+          candidates = [
+              'drivers/misc/mediatek/thermal/mtk_thermal_monitor.c',
+              'drivers/thermal/mtk_thermal.c',
+          ]
+          for p in candidates:
+              if not os.path.exists(p):
+                  continue
+              s = open(p).read()
+              if 'Kaelltzyy no-throttle' in s:
+                  print(p, 'sudah dipatch'); break
+              n, c = re.subn(
+                  r'(static\s+\w+\s+mtk_thermal_set_user_scenarios\b[^{]*\{)',
+                  r'\1\n\treturn 0; /* Kaelltzyy no-throttle */',
+                  s, count=1)
+              if c:
+                  open(p, 'w').write(n)
+                  print('ok    mtk_thermal_set_user_scenarios noop ->', p)
+                  break
+          else:
+              print('mtk_thermal_set_user_scenarios tidak ada di source ini, skip')
+          PYEOF
+
+          # patch MTK di atas menyisipkan return sebelum deklarasi lokal
+          # (kernel dibuild dengan -Werror)
+          for f in drivers/misc/mediatek/thermal/mtk_thermal_monitor.c drivers/thermal/mtk_thermal.c; do
+            if [ -f "$f" ] && grep -q 'Kaelltzyy no-throttle' "$f"; then
+              d=$(dirname "$f"); o=$(basename "$f" .c).o
+              printf '\nCFLAGS_%s += -Wno-declaration-after-statement -Wno-unused-variable -Wno-unused-function\n' "$o" >> "$d/Makefile"
+            fi
+          done
+
+          grep -n "kaelltzyy_zone_temp\|kaelltzyy_bat_temp\|Kaelltzyy no-throttle" \
+            drivers/thermal/thermal_core.c drivers/thermal/thermal_sysfs.c \
+            drivers/power/supply/power_supply_sysfs.c || true
+
+      - name: Temp spoof default (suhu tampilan)
+        env:
+          C: ${{ inputs.spoof_temp_c }}
         run: |
           cd kernel
           python3 - <<'PYEOF'
-          import re, sys
-          src = 'drivers/cpufreq/cpufreq_performance.c'
-          s = open(src).read()
-          # buang blok default governor milik performance (supaya tidak dobel definisi)
-          s = re.sub(r'#ifdef\s+CONFIG_CPU_FREQ_DEFAULT_GOV_PERFORMANCE.*?#endif\n?', '', s, flags=re.S)
-          s = s.replace('cpufreq_gov_performance', 'cpufreq_gov_kaelltzyy')
-          s = s.replace('"performance"', '"kaelltzyy"').replace("'performance'", "'kaelltzyy'")
-          assert 'cpufreq_default_governor' not in s, 'blok default governor masih ada'
-          assert '.name' in s and '"kaelltzyy"' in s
-
-          kc = 'drivers/cpufreq/Kconfig'
-          k = open(kc).read()
-          mk = 'drivers/cpufreq/Makefile'
-          m = open(mk).read()
-          anchor = 'config CPU_FREQ_GOV_POWERSAVE'
-          if anchor not in k:
-              print('::warning::Anchor Kconfig governor tidak ditemukan, governor Kaelltzyy dilewati')
-              sys.exit(0)
-          if 'CPU_FREQ_GOV_KAELLTZYY' not in k:
-              cfg = ('config CPU_FREQ_GOV_KAELLTZYY\n'
-                     '\tbool "\'kaelltzyy\' governor (performance clone)"\n'
-                     '\tdepends on CPU_FREQ\n'
-                     '\tdefault y\n'
-                     '\thelp\n'
-                     '\t  Kaelltzyy governor: statically pins CPU frequency to policy max.\n\n')
-              k = k.replace(anchor, cfg + anchor, 1)
-              open(kc, 'w').write(k)
-          if 'cpufreq_kaelltzyy' not in m:
-              open(mk, 'a').write('\nobj-$(CONFIG_CPU_FREQ_GOV_KAELLTZYY)\t+= cpufreq_kaelltzyy.o\n')
-          open('drivers/cpufreq/cpufreq_kaelltzyy.c', 'w').write(s)
-          print('governor kaelltzyy ditambahkan')
+          import os
+          p = 'drivers/misc/kaelltzyy.c'
+          s = open(p).read()
+          v = os.environ.get('C', '').strip()
+          if not v:
+              s = s.replace('static bool temp_spoof = true;', 'static bool temp_spoof = false;')
+              print('temp spoof dimatikan')
+          else:
+              n = max(-40, min(60, int(v)))
+              old = 'static int temp_spoof_mc = 15000;'
+              assert old in s
+              s = s.replace(old, 'static int temp_spoof_mc = %d;' % (n * 1000))
+              print('temp spoof default =', n, 'C')
+          open(p, 'w').write(s)
           PYEOF
-          grep -n "kaelltzyy" drivers/cpufreq/cpufreq_kaelltzyy.c drivers/cpufreq/Makefile | head
+          grep -n "temp_spoof" drivers/misc/kaelltzyy.c | head
 
       - name: Apply BORE patch
         if: ${{ inputs.bore_patch_url != '' }}
@@ -635,7 +1071,6 @@ jobs:
           if head -c 300 "$P" | grep -qiE '<html|<!doctype'; then
             echo "::warning::URL BORE mengembalikan HTML (pakai link raw, bukan blob), dilewati"; exit 0
           fi
-          # backup file yang disentuh patch, supaya bisa di-revert kalau build gagal
           grep -E '^\+\+\+ ' "$P" | awk '{print $2}' | sed 's|^[ab]/||' | grep -v '^/dev/null$' | sort -u | \
           while read -r f; do
             if [ -f "$f" ]; then
@@ -709,9 +1144,12 @@ jobs:
                           r'\g<1>0; /* Kaelltzyy gaming */', s)
           n, c2 = re.subn(r'(net->ipv4\.sysctl_tcp_fastopen\s*=\s*)TFO_CLIENT_ENABLE;',
                           r'\g<1>TFO_CLIENT_ENABLE | TFO_SERVER_ENABLE; /* Kaelltzyy gaming */', n)
-          if c1 + c2:
+          n, c3 = re.subn(r'(net->ipv4\.sysctl_tcp_autocorking\s*=\s*)1;',
+                          r'\g<1>0; /* Kaelltzyy gaming */', n)
+          if c1 + c2 + c3:
               open(p, 'w').write(n)
-          print('slow_start_after_idle=0:', bool(c1), '| fastopen=3:', bool(c2))
+          print('slow_start_after_idle=0:', bool(c1), '| fastopen=3:', bool(c2),
+                '| autocorking=0:', bool(c3))
           if not c1:
               print('::warning::slow_start_after_idle tidak ditemukan, dilewati')
           if not c2:
@@ -723,7 +1161,10 @@ jobs:
         run: |
           cd kernel
           URL="https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh"
-          if [ "${{ inputs.kernelsu }}" = "next" ]; then
+          if [ "${{ inputs.susfs }}" = "on" ]; then
+            # Branch polos 'next'/tag stabil TIDAK punya hook SUSFS -> wajib branch susfs
+            curl -fLSs --retry 5 --retry-all-errors "$URL" | bash -s "${{ inputs.ksu_susfs_branch }}"
+          elif [ "${{ inputs.kernelsu }}" = "next" ]; then
             curl -fLSs --retry 5 --retry-all-errors "$URL" | bash -s next
           else
             curl -fLSs --retry 5 --retry-all-errors "$URL" | bash -
@@ -731,6 +1172,63 @@ jobs:
           ls -la drivers | grep -i kernelsu
           git -C KernelSU-Next log -1 --oneline
           git -C KernelSU-Next describe --tags --always
+          if [ "${{ inputs.susfs }}" = "on" ]; then
+            if ! grep -rqi "susfs" KernelSU-Next/kernel; then
+              echo "::error::Branch KernelSU-Next '${{ inputs.ksu_susfs_branch }}' tidak mengandung kode SUSFS. Cek nama branch di repo KernelSU-Next."
+              exit 1
+            fi
+            echo "KSU-Next sisi SUSFS: OK"
+          fi
+
+      - name: Integrate SUSFS (kernel side)
+        if: ${{ inputs.kernelsu != 'off' && inputs.susfs == 'on' }}
+        run: |
+          cd kernel
+          if [ -f fs/susfs.c ] && [ -f include/linux/susfs.h ]; then
+            echo "Source sudah punya SUSFS, skip patch kernel"
+          else
+            git clone --depth=1 -b "${{ inputs.susfs_kernel_branch }}" \
+              https://gitlab.com/simonpunk/susfs4ksu.git "$GITHUB_WORKSPACE/susfs4ksu"
+            KP="$GITHUB_WORKSPACE/susfs4ksu/kernel_patches"
+            cp -v "$KP"/fs/* fs/
+            cp -v "$KP"/include/linux/* include/linux/
+            PATCH=$(ls "$KP"/50_add_susfs_in_gki-*.patch | head -1)
+            echo "Patch: $PATCH"
+            if ! patch -p1 --dry-run < "$PATCH"; then
+              echo "::error::Patch SUSFS kernel-side tidak cocok dengan source ini (hunk gagal). Perlu rebase manual."
+              exit 1
+            fi
+            patch -p1 < "$PATCH"
+          fi
+          grep -rn "SUSFS_VERSION" include/linux/susfs*.h | head -3 || true
+          [ -f fs/susfs.c ] || { echo "::error::fs/susfs.c tidak ada"; exit 1; }
+
+      - name: RAM gaming defaults (compaction, watermark, vmstat)
+        if: ${{ inputs.ram_gaming == 'on' }}
+        run: |
+          cd kernel
+          python3 - <<'PYEOF'
+          import re
+          def sub(path, pat, repl, label):
+              try:
+                  s = open(path).read()
+              except FileNotFoundError:
+                  print('::warning::file tidak ada:', path); return
+              n, c = re.subn(pat, repl, s, count=1)
+              if c:
+                  open(path, 'w').write(n); print('ok   ', label)
+              else:
+                  print('::warning::tidak ditemukan, dilewati:', label)
+          # tanpa kcompactd proaktif di background (sumber jank/stutter saat game)
+          sub('mm/compaction.c', r'(sysctl_compaction_proactiveness\s*=\s*)\d+;',
+              r'\g<1>0; /* Kaelltzyy */', 'compaction_proactiveness=0')
+          # kswapd bangun lebih awal -> lebih jarang direct reclaim
+          sub('mm/page_alloc.c', r'(int\s+watermark_scale_factor\s*=\s*)\d+;',
+              r'\g<1>30; /* Kaelltzyy */', 'watermark_scale_factor=30')
+          # vmstat worker lebih jarang bangunin CPU
+          sub('mm/vmstat.c', r'(sysctl_stat_interval\b[^;=]*=\s*)HZ;',
+              r'\g<1>HZ * 5; /* Kaelltzyy */', 'stat_interval=5s')
+          PYEOF
 
       - name: Build
         run: |
@@ -743,6 +1241,7 @@ jobs:
           make $ARGS ${{ inputs.defconfig }}
           LVN="-Kaelltzyy"
           if [ "${{ inputs.kernelsu }}" != "off" ]; then LVN="-Kaelltzyy-KSUN"; fi
+          if [ "${{ inputs.kernelsu }}" != "off" ] && [ "${{ inputs.susfs }}" = "on" ]; then LVN="${LVN}-SUSFS"; fi
           scripts/config --file out/.config --set-str LOCALVERSION "$LVN" -d LOCALVERSION_AUTO
           if [ "${{ inputs.lto_mode }}" = "none" ]; then
             scripts/config --file out/.config \
@@ -753,6 +1252,17 @@ jobs:
           if [ "${{ inputs.kernelsu }}" != "off" ]; then
             scripts/config --file out/.config \
               -e KSU -e KPROBES -e HAVE_KPROBES -e KPROBE_EVENTS
+          fi
+          if [ "${{ inputs.kernelsu }}" != "off" ] && [ "${{ inputs.susfs }}" = "on" ]; then
+            # Simbol yang tidak ada di versi SUSFS ini akan dibuang diam-diam oleh olddefconfig (aman)
+            for sym in KSU_SUSFS KSU_SUSFS_HAS_MAGIC_MOUNT KSU_SUSFS_SUS_PATH KSU_SUSFS_SUS_MOUNT \
+                       KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
+                       KSU_SUSFS_SUS_KSTAT KSU_SUSFS_TRY_UMOUNT KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT \
+                       KSU_SUSFS_OPEN_REDIRECT KSU_SUSFS_SUS_MAP; do
+              scripts/config --file out/.config -e "$sym"
+            done
+            # SPOOF_UNAME sengaja off: bentrok dengan uname spoof driver kaelltzyy
+            scripts/config --file out/.config -d KSU_SUSFS_SPOOF_UNAME -d KSU_SUSFS_ENABLE_LOG
           fi
           scripts/config --file out/.config \
             -d HZ_100 -d HZ_250 -d HZ_300 -e HZ_1000 --set-val HZ 1000
@@ -773,35 +1283,93 @@ jobs:
             scripts/config --file out/.config \
               -d WQ_POWER_EFFICIENT_DEFAULT \
               -e CPU_FREQ_GOV_SCHEDUTIL -e CPU_FREQ_DEFAULT_GOV_SCHEDUTIL \
-              -e UCLAMP_TASK -e UCLAMP_TASK_GROUP
+              -e UCLAMP_TASK -e UCLAMP_TASK_GROUP \
+              -e RCU_EXPERT -e RCU_EXPEDITE_BOOT
           fi
-          scripts/config --file out/.config -e CPU_FREQ_GOV_PERFORMANCE -e CPU_FREQ_GOV_KAELLTZYY
+          if [ "${{ inputs.ram_gaming }}" = "on" ]; then
+            # ZRAM_MEMORY_TRACKING/ZSMALLOC_STAT = overhead debug zram; KSM/THP = scan+compaction di background
+            # init_on_alloc/free + hardening freelist = biaya per alokasi (trade-off keamanan)
+            scripts/config --file out/.config \
+              -d KSM -d TRANSPARENT_HUGEPAGE -d ZRAM_MEMORY_TRACKING -d ZSMALLOC_STAT \
+              -d INIT_ON_ALLOC_DEFAULT_ON -d INIT_ON_FREE_DEFAULT_ON \
+              -d SLAB_FREELIST_HARDENED -d SLAB_FREELIST_RANDOM -d SHUFFLE_PAGE_ALLOCATOR
+          fi
+          if [ "${{ inputs.debug_off }}" = "on" ]; then
+            # Sengaja TIDAK mematikan DEBUG_KERNEL/DEBUG_FS/SCHED_DEBUG/FTRACE:
+            # dibutuhkan KPROBE_EVENTS (KSU), BORE, driver MTK/Mali, dan atrace/perfetto
+            scripts/config --file out/.config \
+              -d DEBUG_INFO -d DEBUG_INFO_BTF -d DEBUG_INFO_REDUCED -d DEBUG_INFO_SPLIT \
+              -d SLUB_DEBUG -d SLUB_DEBUG_ON -d SLUB_STATS \
+              -d DEBUG_LIST -d DEBUG_PLIST -d DEBUG_SG -d DEBUG_NOTIFIERS -d DEBUG_CREDENTIALS \
+              -d DEBUG_PAGEALLOC -d PAGE_OWNER -d PAGE_POISONING -d DEBUG_VM -d DEBUG_VIRTUAL \
+              -d DEBUG_OBJECTS -d DEBUG_KMEMLEAK -d DEBUG_STACK_USAGE -d DEBUG_KOBJECT \
+              -d DEBUG_PREEMPT -d DEBUG_ATOMIC_SLEEP -d DEBUG_SPINLOCK -d DEBUG_MUTEXES \
+              -d DEBUG_RT_MUTEXES -d DEBUG_WW_MUTEX_SLOWPATH -d LOCKDEP -d PROVE_LOCKING \
+              -d LOCK_STAT -d KASAN -d UBSAN -d KCOV -d KFENCE -d FAULT_INJECTION \
+              -d DYNAMIC_DEBUG -d LATENCYTOP -d RCU_TRACE -d PM_DEBUG -d PM_SLEEP_DEBUG \
+              -e CRYPTO_MANAGER_DISABLE_TESTS \
+              --set-val CONSOLE_LOGLEVEL_DEFAULT 3 --set-val CONSOLE_LOGLEVEL_QUIET 1
+          fi
+          if grep -q '^config LRU_GEN' mm/Kconfig; then
+            scripts/config --file out/.config -e LRU_GEN -e LRU_GEN_ENABLED
+          else
+            echo "::warning::LRU_GEN (MGLRU) tidak ada di source ini, dilewati"
+          fi
           make $ARGS olddefconfig
-          grep -E "^CONFIG_(TCP_CONG_BBR|MQ_IOSCHED_ADIOS|ZRAM_DEF_COMP_LZ4|DEFAULT_NET_SCH)" out/.config || true
+          grep -E "^CONFIG_(LRU_GEN|TCP_CONG_BBR|MQ_IOSCHED_ADIOS|ZRAM_DEF_COMP_LZ4|DEFAULT_NET_SCH)" out/.config || true
           grep -E "^CONFIG_HZ" out/.config
+          if grep -q '^CONFIG_LRU_GEN=y' out/.config; then
+            echo "MGLRU AKTIF: $(grep -E '^CONFIG_LRU_GEN(_ENABLED)?=' out/.config | tr '\n' ' ')"
+          else
+            echo "::warning::MGLRU TIDAK aktif di .config akhir"
+            grep -n -A14 '^config LRU_GEN' mm/Kconfig \
+              || echo "mm/Kconfig tidak punya LRU_GEN: source ini belum ada MGLRU (perlu backport)"
+          fi
           grep -E "^CONFIG_(LTO|CFI_CLANG|KSU|KPROBES|LOCALVERSION)" out/.config || true
+          if [ "${{ inputs.debug_off }}" = "on" ]; then
+            echo "=== opsi debug yang MASIH aktif di .config akhir ==="
+            grep -E "^CONFIG_(DEBUG_INFO|SLUB_DEBUG|DEBUG_LIST|LOCKDEP|PROVE_LOCKING|KASAN|UBSAN|PAGE_OWNER|DEBUG_PREEMPT|DEBUG_ATOMIC_SLEEP|DEBUG_SPINLOCK|DEBUG_MUTEXES|DYNAMIC_DEBUG|DEBUG_VM|PM_DEBUG)[A-Z_]*=y" out/.config || echo "bersih"
+          fi
+          if [ "${{ inputs.ram_gaming }}" = "on" ]; then
+            echo "=== RAM gaming config ==="
+            grep -E "^(# )?CONFIG_(KSM|TRANSPARENT_HUGEPAGE|INIT_ON_ALLOC_DEFAULT_ON|ZRAM_MEMORY_TRACKING)[ =]" out/.config || true
+          fi
           if [ "${{ inputs.kernelsu }}" != "off" ]; then
             grep -q '^CONFIG_KSU=y' out/.config || { echo "::error::CONFIG_KSU tidak aktif"; exit 1; }
           fi
+          if [ "${{ inputs.kernelsu }}" != "off" ] && [ "${{ inputs.susfs }}" = "on" ]; then
+            echo "=== SUSFS config akhir ==="
+            grep -E "^CONFIG_KSU_SUSFS" out/.config || true
+            grep -q '^CONFIG_KSU_SUSFS=y' out/.config || {
+              echo "::error::CONFIG_KSU_SUSFS tidak aktif di .config akhir (simbol Kconfig tidak ada / depend tidak terpenuhi)"
+              grep -rn "config KSU_SUSFS" drivers/kernelsu/ KernelSU-Next/kernel/Kconfig fs/Kconfig 2>/dev/null | head || true
+              exit 1
+            }
+          fi
           make $ARGS -j$(nproc) Image
           BEOF
-          if ! bash "$GITHUB_WORKSPACE/do_build.sh"; then
-            if [ -f .applied_bore ]; then
-              echo "::warning::Build gagal dengan BORE, revert BORE lalu build ulang tanpa BORE"
-              if [ -d "$GITHUB_WORKSPACE/bore_backup" ]; then
-                cp -a "$GITHUB_WORKSPACE/bore_backup/." .
-              fi
-              if [ -f "$GITHUB_WORKSPACE/bore_newfiles" ]; then
-                while read -r f; do rm -f "$f"; done < "$GITHUB_WORKSPACE/bore_newfiles"
-              fi
-              sed -i '/^CONFIG_SCHED_BORE=y$/d' arch/arm64/configs/${{ inputs.defconfig }}
-              rm -f .applied_bore
-              rm -rf out
-              bash "$GITHUB_WORKSPACE/do_build.sh"
-            else
-              exit 1
+          build_ok=0
+          bash "$GITHUB_WORKSPACE/do_build.sh" && build_ok=1
+          if [ "$build_ok" != 1 ] && [ -f .applied_bore ]; then
+            echo "::warning::Build gagal dengan BORE, revert BORE lalu build ulang tanpa BORE"
+            if [ -d "$GITHUB_WORKSPACE/bore_backup" ]; then
+              cp -a "$GITHUB_WORKSPACE/bore_backup/." .
             fi
+            if [ -f "$GITHUB_WORKSPACE/bore_newfiles" ]; then
+              while read -r f; do rm -f "$f"; done < "$GITHUB_WORKSPACE/bore_newfiles"
+            fi
+            sed -i '/^CONFIG_SCHED_BORE=y$/d' arch/arm64/configs/${{ inputs.defconfig }}
+            rm -f .applied_bore
+            rm -rf out
+            bash "$GITHUB_WORKSPACE/do_build.sh" && build_ok=1
           fi
+          if [ "$build_ok" != 1 ] && [ "${{ inputs.opt_o3 }}" = "on" ]; then
+            echo "::warning::Build gagal dengan -O3, build ulang dengan -O2"
+            export ARGS="${ARGS/ KCFLAGS=-O3/}"
+            rm -rf out
+            bash "$GITHUB_WORKSPACE/do_build.sh" && build_ok=1
+          fi
+          [ "$build_ok" = 1 ] || { echo "::error::Build gagal"; exit 1; }
 
       - name: Package AnyKernel3
         run: |
