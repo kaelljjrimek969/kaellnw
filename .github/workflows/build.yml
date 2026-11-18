@@ -60,12 +60,12 @@ on:
       ram_gaming:
         description: "RAM gaming: kurangi stall alokasi/reclaim (compaction, watermark, KSM/THP off, init_on_alloc off): on / off"
         type: choice
-        options: [on, off]
+        options: ["on", "off"]
         default: "on"
       debug_off:
         description: "Matikan overhead debug (lockdep, slub debug, debug info, page owner, dll): on / off"
         type: choice
-        options: [on, off]
+        options: ["on", "off"]
         default: "on"
       opt_o3:
         description: "Compile -O3 (lebih kencang, build lebih lama, kecil kemungkinan gagal): on / off"
@@ -1156,6 +1156,32 @@ jobs:
               print('::warning::tcp_fastopen default tidak ditemukan, dilewati')
           PYEOF
 
+      - name: Low-latency network defaults (notsent_lowat, output limit, backlog)
+        if: ${{ inputs.gaming_tweaks == 'on' }}
+        run: |
+          cd kernel
+          python3 - <<'PYEOF'
+          import re
+          def sub(path, pat, repl, label):
+              try:
+                  s = open(path).read()
+              except FileNotFoundError:
+                  print('::warning::file tidak ada:', path); return
+              n, c = re.subn(pat, repl, s, count=1)
+              if c:
+                  open(path, 'w').write(n); print('ok   ', label)
+              else:
+                  print('::warning::tidak ditemukan, dilewati:', label)
+          # antrean kirim di socket lebih pendek -> latency lebih rendah (bufferbloat lokal)
+          sub('net/ipv4/tcp_ipv4.c', r'(sysctl_tcp_notsent_lowat\s*=\s*)UINT_MAX;',
+              r'\g<1>131072; /* Kaelltzyy lowlat */', 'tcp_notsent_lowat=128K')
+          sub('net/ipv4/tcp_ipv4.c', r'(sysctl_tcp_limit_output_bytes\s*=\s*)\d+;',
+              r'\g<1>262144; /* Kaelltzyy lowlat */', 'tcp_limit_output_bytes=256K')
+          # backlog RX lebih besar -> tidak drop paket saat burst
+          sub('net/core/dev.c', r'(int\s+netdev_max_backlog\s*__read_mostly\s*=\s*)\d+;',
+              r'\g<1>2000; /* Kaelltzyy lowlat */', 'netdev_max_backlog=2000')
+          PYEOF
+
       - name: Integrate KernelSU-Next
         if: ${{ inputs.kernelsu != 'off' }}
         run: |
@@ -1229,6 +1255,53 @@ jobs:
           sub('mm/vmstat.c', r'(sysctl_stat_interval\b[^;=]*=\s*)HZ;',
               r'\g<1>HZ * 5; /* Kaelltzyy */', 'stat_interval=5s')
           PYEOF
+          echo "=== baris asli di source (diagnostik) ==="
+          grep -nE "sysctl_compaction_proactiveness *=|watermark_scale_factor *=|sysctl_stat_interval *=" \
+            mm/compaction.c mm/page_alloc.c mm/vmstat.c || echo "tidak ada yang cocok"
+
+      - name: RAM gaming runtime fallback (vm sysctl via driver Kaelltzyy)
+        if: ${{ inputs.ram_gaming == 'on' }}
+        run: |
+          cd kernel
+          python3 - <<'PYEOF'
+          p = 'drivers/misc/kaelltzyy.c'
+          s = open(p).read()
+          assert 'kz_vm_fn' not in s
+          code = '''/* Kaelltzyy ram: tulis vm.* lewat /proc setelah init userspace; diulang 3x */
+          static struct delayed_work vm_work;
+          static int vm_tries;
+          static const struct {
+              const char *path;
+              const char *val;
+          } kz_vm[] = {
+              { "/proc/sys/vm/compaction_proactiveness", "0" },
+              { "/proc/sys/vm/watermark_scale_factor", "30" },
+              { "/proc/sys/vm/stat_interval", "5" },
+          };
+
+          static void kz_vm_fn(struct work_struct *w)
+          {
+              int i, fail = 0;
+
+              for (i = 0; i < ARRAY_SIZE(kz_vm); i++)
+                  if (kz_write_file(kz_vm[i].path, kz_vm[i].val))
+                      fail++;
+              pr_info("vm sysctl applied (fail=%d)\\n", fail);
+              if (++vm_tries < 3)
+                  schedule_delayed_work(&vm_work, 60 * HZ);
+          }
+
+          '''
+          code = code.replace('\n          ', '\n')
+          a = 'static int __init kz_init(void)'
+          assert a in s
+          s = s.replace(a, code + a, 1)
+          b = '    INIT_DELAYED_WORK(&gpu_work, kz_gpu_fn);'
+          assert b in s
+          s = s.replace(b, b + '\n    INIT_DELAYED_WORK(&vm_work, kz_vm_fn);\n    schedule_delayed_work(&vm_work, 45 * HZ);', 1)
+          open(p, 'w').write(s)
+          print('vm fallback ditambahkan ke driver')
+          PYEOF
 
       - name: Build
         run: |
@@ -1285,6 +1358,8 @@ jobs:
               -e CPU_FREQ_GOV_SCHEDUTIL -e CPU_FREQ_DEFAULT_GOV_SCHEDUTIL \
               -e UCLAMP_TASK -e UCLAMP_TASK_GROUP \
               -e RCU_EXPERT -e RCU_EXPEDITE_BOOT
+            # WiFi power save off by default -> latency ping lebih stabil
+            scripts/config --file out/.config -d CFG80211_DEFAULT_PS
           fi
           if [ "${{ inputs.ram_gaming }}" = "on" ]; then
             # ZRAM_MEMORY_TRACKING/ZSMALLOC_STAT = overhead debug zram; KSM/THP = scan+compaction di background
